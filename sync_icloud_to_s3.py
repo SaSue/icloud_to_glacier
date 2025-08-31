@@ -69,7 +69,7 @@ log = logging.getLogger("icloud-glacier-backup")
 def init_db(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
-    conn.execute(\"\"\"
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS uploads (
             asset_id TEXT PRIMARY KEY,
             s3_key   TEXT NOT NULL,
@@ -77,7 +77,7 @@ def init_db(db_path: str):
             md5_hex  TEXT,
             uploaded_at TEXT NOT NULL
         )
-    \"\"\")
+    """)
     conn.commit()
     return conn
 
