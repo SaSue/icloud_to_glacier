@@ -1,0 +1,29 @@
+
+version: "3.8"
+services:
+  icloud-glacier-backup:
+    build: .
+    container_name: icloud-glacier-backup
+    restart: unless-stopped
+    environment:
+      - APPLE_ID=${APPLE_ID}
+      - APPLE_PASSWORD=${APPLE_PASSWORD}
+      # - ICLOUD_2FA_CODE=${ICLOUD_2FA_CODE}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION}
+      - S3_BUCKET=${S3_BUCKET}
+      - S3_PREFIX=${S3_PREFIX}
+      - S3_STORAGE_CLASS=${S3_STORAGE_CLASS}
+      # - S3_SSE=AES256
+      # - S3_SSE=aws:kms
+      # - S3_SSE_KMS_KEY_ID=arn:aws:kms:eu-central-1:123456789012:key/abcd-...
+      - LOOP_INTERVAL_SECONDS=${LOOP_INTERVAL_SECONDS}
+      - MAX_ASSETS_PER_RUN=${MAX_ASSETS_PER_RUN}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ICLOUD_COOKIE_DIR=/cookies
+      - STATE_DB_PATH=/state/db.sqlite3
+      - TZ=${TZ}
+    volumes:
+      - ./state:/state
+      - ./cookies:/cookies

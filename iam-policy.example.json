@@ -1,0 +1,22 @@
+
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowS3PutAndList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:AbortMultipartUpload",
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:HeadBucket",
+        "s3:HeadObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::mein-glacier-bucket",
+        "arn:aws:s3:::mein-glacier-bucket/*"
+      ]
+    }
+  ]
+}
