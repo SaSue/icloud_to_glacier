@@ -17,6 +17,7 @@ from botocore.config import Config as BotoConfig
 from botocore.exceptions import ClientError
 
 from pyicloud import PyiCloudService
+from glob import glob
 
 APPLE_ID = os.environ.get("APPLE_ID")
 APPLE_PASSWORD = os.environ.get("APPLE_PASSWORD")
@@ -44,6 +45,40 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("icloud-glacier-backup")
+
+def _log_cookie_dir(cookie_dir: Path):
+    try:
+        files = list(cookie_dir.glob("*"))
+        if not files:
+            log.warning("Cookie-Verzeichnis ist leer: %s (Session kann nicht wiederverwendet werden)", cookie_dir)
+        else:
+            names = ", ".join(f.name for f in files[:10])
+            more = "" if len(files) <= 10 else f" (+{len(files)-10} weitere)"
+            log.info("Cookie-Dateien in %s: %s%s", cookie_dir, names, more)
+    except Exception as e:
+        log.debug("Cookie-Verzeichnis konnte nicht gelistet werden: %s", e)
+
+def _persist_session(api):
+    # Versuche diverse pyicloud-internen Hooks aufzurufen, damit Cookies sicher auf Disk landen
+    for attr in ("save_session", "_store_session", "persist_session"):
+        fn = getattr(api, attr, None)
+        if callable(fn):
+            try:
+                fn()
+                log.info("Session über %s() persistiert.", attr)
+                return
+            except Exception as e:
+                log.debug("Persist via %s() fehlgeschlagen: %s", attr, e)
+    # Letzter Versuch: falls die Requests-Cookies ein save() besitzen (MozillaCookieJar o.ä.)
+    try:
+        cj = getattr(api, "session", None)
+        cj = getattr(cj, "cookies", None)
+        if hasattr(cj, "save"):
+            cj.save()
+            log.info("Session-Cookies via cookiejar.save() persistiert.")
+    except Exception as e:
+        log.debug("cookiejar.save() fehlgeschlagen: %s", e)
+
 
 def init_db(db_path: str):
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
