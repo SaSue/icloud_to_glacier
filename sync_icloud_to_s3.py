@@ -1,8 +1,14 @@
-#!/usr/bin/env python3
-# iCloud → S3 (Glacier-*) incremental backup with pyicloud, interactive 2FA/2SA,
-# trusted-session short-circuit, and cookie persistence.
 
-import os, sys, time, logging, sqlite3, tempfile, hashlib, getpass
+#!/usr/bin/env python3
+# iCloud → S3 (Glacier-*) incremental backup (v2)
+# - pyicloud with interactive 2FA/2SA or file-based code (/state/2fa_code.txt)
+# - Exports BOTH variants: original + current (edited/rendered if available)
+# - Writes sidecar JSON metadata (per variant), optional album membership (ALBUMS_SCAN)
+# - DB migration from old schema (PRIMARY KEY asset_id) to new (asset_id, variant)
+# - Trusted session reuse & cookie persistence
+# - Stage/heartbeat logs; STARTUP_TEST_LIMIT to smoke-test on big libraries
+
+import os, sys, time, json, logging, sqlite3, tempfile, hashlib, getpass
 from datetime import datetime
 from pathlib import Path
 
@@ -22,11 +28,19 @@ AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "eu-central-1")
 S3_BUCKET = os.environ.get("S3_BUCKET")
 S3_PREFIX = os.environ.get("S3_PREFIX", "icloud/photos").strip("/")
 S3_STORAGE_CLASS = os.environ.get("S3_STORAGE_CLASS", "DEEP_ARCHIVE")
-S3_SSE = os.environ.get("S3_SSE")
+
+S3_SSE = os.environ.get("S3_SSE")  # "AES256" oder "aws:kms"
 S3_SSE_KMS_KEY_ID = os.environ.get("S3_SSE_KMS_KEY_ID")
+
+# Sidecar control
+EXPORT_METADATA = os.environ.get("EXPORT_METADATA", "sidecar").lower()  # "sidecar" | "none"
+SIDECAR_STORAGE_CLASS = os.environ.get("SIDECAR_STORAGE_CLASS", "STANDARD")  # schnell zugreifbar
+ALBUMS_SCAN = os.environ.get("ALBUMS_SCAN", "false").lower() not in ("0","false","no")  # optional, schwergewichtig
+ALBUMS_INDEX_PREFIX = os.environ.get("ALBUMS_INDEX_PREFIX", "_albums").strip("/")
 
 LOOP_INTERVAL_SECONDS = int(os.environ.get("LOOP_INTERVAL_SECONDS", "21600"))
 MAX_ASSETS_PER_RUN = int(os.environ.get("MAX_ASSETS_PER_RUN", "0"))
+STARTUP_TEST_LIMIT = int(os.environ.get("STARTUP_TEST_LIMIT", "0"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # 2FA/2SA inputs
@@ -42,6 +56,15 @@ logging.basicConfig(
 log = logging.getLogger("icloud-glacier-backup")
 
 # ---- Helpers ----
+def _stage(msg: str): log.info("STAGE | %s", msg)
+
+def _heartbeat(tag: str, every: int = 5):
+    if not hasattr(_heartbeat, "_last"): _heartbeat._last = 0
+    now = time.time()
+    if now - _heartbeat._last >= every:
+        log.info("HEARTBEAT | %s ...", tag)
+        _heartbeat._last = now
+
 def _log_cookie_dir(cookie_dir: Path):
     try:
         files = list(cookie_dir.glob("*"))
@@ -95,28 +118,41 @@ def _prompt(label: str, secret: bool = False) -> str:
     except Exception:
         return ""
 
-# ---- DB ----
-def init_db(db_path: str):
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS uploads (
-            asset_id TEXT PRIMARY KEY,
-            s3_key   TEXT NOT NULL,
-            size     INTEGER,
-            md5_hex  TEXT,
-            uploaded_at TEXT NOT NULL
-        )
-    """)
-    conn.commit()
-    return conn
-
 def md5_of_file(path: str, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
+
+# ---- DB (with migration) ----
+def init_db(db_path: str):
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS uploads (
+            asset_id TEXT,
+            variant  TEXT,
+            s3_key   TEXT NOT NULL,
+            size     INTEGER,
+            md5_hex  TEXT,
+            uploaded_at TEXT NOT NULL,
+            PRIMARY KEY (asset_id, variant)
+        )
+    """)
+    conn.commit()
+    return conn
+
+def mark_uploaded(conn, asset_id: str, variant: str, key: str, size: int, md5_hex: str):
+    conn.execute(
+        "INSERT OR REPLACE INTO uploads (asset_id, variant, s3_key, size, md5_hex, uploaded_at) VALUES (?,?,?,?,?,?)",
+        (asset_id, variant, key, size, md5_hex, datetime.utcnow().isoformat(timespec="seconds")),
+    )
+    conn.commit()
+
+def already_uploaded(conn, asset_id: str, variant: str) -> bool:
+    cur = conn.execute("SELECT 1 FROM uploads WHERE asset_id=? AND variant=?", (asset_id, variant))
+    return bool(cur.fetchone())
 
 # ---- iCloud ----
 def connect_icloud() -> PyiCloudService:
@@ -130,7 +166,7 @@ def connect_icloud() -> PyiCloudService:
     _log_cookie_dir(cookie_dir)
     api = PyiCloudService(APPLE_ID, APPLE_PASSWORD, cookie_directory=str(cookie_dir))
 
-    # 1) Trusted session?
+    # Trusted session?
     is_trusted_fn = getattr(api, "is_trusted_session", None)
     if callable(is_trusted_fn):
         try:
@@ -151,7 +187,7 @@ def connect_icloud() -> PyiCloudService:
             or ""
         )
 
-    # 2) 2FA flow
+    # 2FA flow
     if bool(getattr(api, "requires_2fa", False)):
         log.warning("2FA erforderlich.")
         validate_2fa = getattr(api, "validate_2fa_code", None)
@@ -172,7 +208,7 @@ def connect_icloud() -> PyiCloudService:
         _log_cookie_dir(cookie_dir)
         return api
 
-    # 3) 2SA flow
+    # 2SA flow
     if bool(getattr(api, "requires_2sa", False)):
         log.warning("2-Schritt-Bestätigung (2SA) erforderlich.")
         devices = getattr(api, "trusted_devices", [])
@@ -221,6 +257,30 @@ def connect_icloud() -> PyiCloudService:
 def s3_client():
     return boto3.client("s3", region_name=AWS_REGION, config=BotoConfig(retries={"max_attempts": 10, "mode": "standard"}, connect_timeout=30, read_timeout=300))
 
+def s3_upload_bytes(s3, data: bytes, key: str, storage_class: str = None, extra_meta: dict = None):
+    args = {}
+    if storage_class:
+        args["StorageClass"] = storage_class
+    if S3_SSE:
+        args["ServerSideEncryption"] = S3_SSE
+        if S3_SSE == "aws:kms" and S3_SSE_KMS_KEY_ID:
+            args["SSEKMSKeyId"] = S3_SSE_KMS_KEY_ID
+    if extra_meta:
+        args["Metadata"] = {k:str(v)[:200] for k,v in extra_meta.items()}
+    s3.put_object(Bucket=S3_BUCKET, Key=key, Body=data, **args)
+
+def s3_upload_file(s3, local_path: str, key: str, storage_class: str = None, extra_meta: dict = None):
+    extra = {}
+    if storage_class:
+        extra["StorageClass"] = storage_class
+    if S3_SSE:
+        extra["ServerSideEncryption"] = S3_SSE
+        if S3_SSE == "aws:kms" and S3_SSE_KMS_KEY_ID:
+            extra["SSEKMSKeyId"] = S3_SSE_KMS_KEY_ID
+    if extra_meta:
+        extra["Metadata"] = {k:str(v)[:200] for k,v in (extra_meta.items())}
+    s3.upload_file(local_path, S3_BUCKET, key, ExtraArgs=extra)
+
 def s3_object_exists(s3, bucket: str, key: str) -> bool:
     try:
         s3.head_object(Bucket=bucket, Key=key); return True
@@ -228,24 +288,36 @@ def s3_object_exists(s3, bucket: str, key: str) -> bool:
         if e.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"): return False
         raise
 
-def upload_file_to_s3(s3, local_path: str, key: str):
-    extra = {"StorageClass": S3_STORAGE_CLASS}
-    if S3_SSE:
-        extra["ServerSideEncryption"] = S3_SSE
-        if S3_SSE == "aws:kms" and S3_SSE_KMS_KEY_ID:
-            extra["SSEKMSKeyId"] = S3_SSE_KMS_KEY_ID
-    s3.upload_file(local_path, S3_BUCKET, key, ExtraArgs=extra)
+# ---- Variant & keys ----
+def choose_current_version_label(asset):
+    versions = getattr(asset, "versions", {}) or {}
+    if hasattr(versions, "keys"):
+        keys = list(versions.keys())
+        lower_map = {k.lower(): k for k in keys}
+        preferred = [
+            "renderedfullsize", "editedfullsize", "adjustedfull", "fullres", "fullsize",
+            "full", "original"
+        ]
+        for token in preferred:
+            if token in lower_map:
+                key = lower_map[token]
+                if token != "original":
+                    return ("current", key)
+                else:
+                    return ("original", key)
+        for token in preferred:
+            for k in keys:
+                name = k.replace("_","").replace("-","").lower()
+                if token in name:
+                    if token != "original":
+                        return ("current", k)
+                    else:
+                        return ("original", k)
+        if keys:
+            return ("original", keys[0])
+    return ("original", "original")
 
-def mark_uploaded(conn, asset_id: str, key: str, size: int, md5_hex: str):
-    conn.execute(
-        "INSERT OR REPLACE INTO uploads (asset_id, s3_key, size, md5_hex, uploaded_at) VALUES (?,?,?,?,?)",
-        (asset_id, key, size, md5_hex, datetime.utcnow().isoformat(timespec="seconds")),
-    ); conn.commit()
-
-def already_uploaded(conn, asset_id: str) -> bool:
-    return bool(conn.execute("SELECT 1 FROM uploads WHERE asset_id=?", (asset_id,)).fetchone())
-
-def build_s3_key(asset, filename: str) -> str:
+def build_key_legacy(asset, filename: str) -> str:
     dt = getattr(asset, "asset_date", None) or getattr(asset, "created", None) or datetime.utcnow()
     try: year, month = dt.year, dt.month
     except Exception:
@@ -257,58 +329,202 @@ def build_s3_key(asset, filename: str) -> str:
     asset_id = getattr(asset, "id", None) or getattr(asset, "guid", None) or "unknownid"
     return f"{S3_PREFIX}/{year:04d}/{month:02d}/{asset_id}_{filename}"
 
+def build_key_variant(asset, filename: str, variant: str) -> str:
+    dt = getattr(asset, "asset_date", None) or getattr(asset, "created", None) or datetime.utcnow()
+    try: year, month = dt.year, dt.month
+    except Exception:
+        try:
+            from datetime import datetime as _dt
+            _dt2 = _dt.fromisoformat(str(dt)); year, month = _dt2.year, _dt2.month
+        except Exception:
+            year, month = 1970, 1
+    asset_id = getattr(asset, "id", None) or getattr(asset, "guid", None) or "unknownid"
+    return f"{S3_PREFIX}/{year:04d}/{month:02d}/{asset_id}_{variant}_{filename}"
+
+# ---- Sidecar ----
+def extract_asset_metadata(asset) -> dict:
+    md = {}
+    def g(name, default=None): return getattr(asset, name, default)
+    md["id"] = g("id") or g("guid")
+    md["filename"] = g("filename")
+    md["created"] = str(g("created", ""))
+    md["added"] = str(getattr(asset, "added", ""))
+    md["modified"] = str(getattr(asset, "modified", ""))
+    md["dimensions"] = {"width": g("width"), "height": g("height")}
+    md["duration"] = g("duration", None)
+    md["orientation"] = g("orientation", None)
+    loc = getattr(asset, "location", None)
+    if isinstance(loc, dict):
+        md["location"] = {k: loc.get(k) for k in ("latitude","longitude","altitude") if k in loc}
+    elif loc:
+        md["location"] = str(loc)
+    versions = getattr(asset, "versions", {}) or {}
+    try:
+        md["versions"] = list(versions.keys())
+    except Exception:
+        md["versions"] = []
+    md["is_favorite"] = bool(getattr(asset, "is_favorite", False))
+    md["is_hidden"] = bool(getattr(asset, "is_hidden", False))
+    return md
+
+def make_sidecar(asset, variant: str, s3_key: str, size: int, md5_hex: str, albums_for_asset: list) -> bytes:
+    base = extract_asset_metadata(asset)
+    base.update({
+        "asset_id": base.get("id"),
+        "variant": variant,
+        "s3_key": s3_key,
+        "backup": {
+            "size": size,
+            "md5_hex": md5_hex,
+            "uploaded_at": datetime.utcnow().isoformat(timespec="seconds")
+        },
+        "albums": albums_for_asset or []
+    })
+    return (json.dumps(base, ensure_ascii=False, separators=(",",":")) + "\n").encode("utf-8")
+
+# ---- Albums scan (optional, heavy) ----
+def build_albums_membership(api):
+    _stage("Album-Scan gestartet (ALBUMS_SCAN=true)")
+    membership = {}
+    albums = getattr(api.photos, "albums", {})
+    for album_name, album in getattr(albums, "items", lambda: [])():
+        _stage(f"Scanne Album: {album_name}")
+        for asset in album:
+            aid = getattr(asset, "id", None) or getattr(asset, "guid", None)
+            if not aid: continue
+            arr = membership.setdefault(aid, [])
+            album_id = getattr(album, "id", None) or album_name
+            arr.append({"album_id": str(album_id), "album_name": album_name})
+            _heartbeat("Album-Scan")
+    _stage("Album-Scan fertig")
+    return membership
+
 # ---- Main pass ----
 def process_once():
+    _stage('Beginne Durchlauf')
     api = connect_icloud()
+    _stage('iCloud verbunden')
     conn = init_db(STATE_DB_PATH)
+    _stage('Datenbank OK')
     s3 = s3_client()
+    _stage('S3-Client OK')
 
+    albums_membership = {}
+    if ALBUMS_SCAN:
+        try:
+            albums_membership = build_albums_membership(api)
+        except Exception as e:
+            log.warning("Album-Scan fehlgeschlagen/übersprungen: %s", e)
+
+    _stage('Ermittle Foto-Iterator')
+    iterator = None
     try:
-        iterator = api.photos.albums.get("All Photos") or api.photos.all
-    except Exception:
+        albums = getattr(api.photos, "albums", None)
+        if albums and hasattr(albums, "get"):
+            all_photos = api.photos.albums.get("All Photos")
+            if all_photos:
+                iterator = all_photos
+                log.info("Nutze Album-Iterator: All Photos")
+        if iterator is None:
+            iterator = api.photos.all
+            log.info("Nutze globalen Iterator: photos.all")
+    except Exception as e:
+        log.warning("Konnte Album 'All Photos' nicht ermitteln: %s – nutze photos.all", e)
         iterator = api.photos.all
 
+    _stage('Starte Iteration')
     processed = skipped = uploaded = 0
+    count = 0
+
     for asset in iterator:
+        _heartbeat('Listing/Download')
+        count += 1
+        if STARTUP_TEST_LIMIT and count > STARTUP_TEST_LIMIT:
+            log.info('STARTUP_TEST_LIMIT=%s erreicht – vorzeitig abbrechen.', STARTUP_TEST_LIMIT)
+            break
+
         asset_id = getattr(asset, "id", None) or getattr(asset, "guid", None)
         filename = getattr(asset, "filename", None) or f"{asset_id or 'asset'}.bin"
         if not asset_id:
-            log.warning("Überspringe Asset ohne ID (Datei: %s)", filename); skipped += 1; continue
-        if already_uploaded(conn, asset_id):
-            skipped += 1; continue
-        key = build_s3_key(asset, filename)
-        if s3_object_exists(s3, S3_BUCKET, key):
-            log.info("Schon in S3 vorhanden, trage in DB ein: %s", key)
-            mark_uploaded(conn, asset_id, key, size=0, md5_hex=""); skipped += 1; continue
-        try:
-            dl = asset.download()
-            stream = dl.iter_content(chunk_size=1024*1024) if hasattr(dl, "iter_content") else (getattr(dl, "response", None) or getattr(dl, "raw", None) or dl).iter_content(chunk_size=1024*1024)
-            with tempfile.NamedTemporaryFile(prefix="icloud_", suffix="_asset", delete=False) as tmp:
-                tmp_path = tmp.name
-                for chunk in stream:
-                    if chunk: tmp.write(chunk)
-            size = os.path.getsize(tmp_path)
-            md5_hex = md5_of_file(tmp_path)
-            upload_file_to_s3(s3, tmp_path, key)
-            mark_uploaded(conn, asset_id, key, size=size, md5_hex=md5_hex)
-            uploaded += 1
-            log.info("Hochgeladen: %s (%s bytes) -> s3://%s/%s", filename, size, S3_BUCKET, key)
-        except ClientError as e:
-            log.error("AWS S3 Fehler bei %s: %s", filename, e)
-        except Exception as e:
-            log.error("Fehler bei %s: %s", filename, e)
-        finally:
+            log.warning("Überspringe Asset ohne ID (Datei: %s)", filename)
+            skipped += 1
+            continue
+
+        plan = [("original", "original")]
+        cur_variant, cur_key = choose_current_version_label(asset)
+        if not (cur_variant == "original" and cur_key == "original"):
+            plan.append((cur_variant, cur_key))
+
+        albums_for_asset = albums_membership.get(asset_id) if albums_membership else []
+
+        for variant, version_key in plan:
             try:
-                if "tmp_path" in locals() and os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
+                if already_uploaded(conn, asset_id, variant):
+                    skipped += 1
+                    continue
+
+                new_key = build_key_variant(asset, filename, variant)
+                legacy_key = build_key_legacy(asset, filename) if variant == "original" else None
+
+                if legacy_key and s3_object_exists(s3, S3_BUCKET, legacy_key):
+                    log.info("Migration: Fand legacy-Objekt, übernehme ohne Neu-Upload: %s", legacy_key)
+                    mark_uploaded(conn, asset_id, "original", legacy_key, size=0, md5_hex="")
+                    if EXPORT_METADATA == "sidecar":
+                        sidecar = make_sidecar(asset, "original", legacy_key, size=0, md5_hex="", albums_for_asset=albums_for_asset)
+                        s3_upload_bytes(s3, sidecar, legacy_key + ".json", storage_class=SIDECAR_STORAGE_CLASS,
+                                        extra_meta={"asset-id": asset_id, "variant": "original"})
+                    skipped += 1
+                    continue
+
+                try:
+                    dl = asset.download(version_key)
+                except TypeError:
+                    dl = asset.download()
+
+                if hasattr(dl, "iter_content"):
+                    stream = dl.iter_content(chunk_size=1024 * 1024)
+                else:
+                    resp = getattr(dl, "response", None) or getattr(dl, "raw", None) or dl
+                    stream = resp.iter_content(chunk_size=1024 * 1024)
+
+                with tempfile.NamedTemporaryFile(prefix=f"icloud_{variant}_", suffix="_asset", delete=False) as tmp:
+                    tmp_path = tmp.name
+                    for chunk in stream:
+                        if chunk:
+                            tmp.write(chunk)
+
+                size = os.path.getsize(tmp_path)
+                md5_hex = md5_of_file(tmp_path)
+
+                s3_upload_file(s3, tmp_path, new_key, storage_class=S3_STORAGE_CLASS,
+                               extra_meta={"asset-id": asset_id, "variant": variant})
+                mark_uploaded(conn, asset_id, variant, new_key, size=size, md5_hex=md5_hex)
+                uploaded += 1
+                log.info("Hochgeladen (%s, %s): %s (%s bytes) -> s3://%s/%s", variant, version_key, filename, size, S3_BUCKET, new_key)
+
+                if EXPORT_METADATA == "sidecar":
+                    sidecar = make_sidecar(asset, variant, new_key, size=size, md5_hex=md5_hex, albums_for_asset=albums_for_asset)
+                    s3_upload_bytes(s3, sidecar, new_key + ".json", storage_class=SIDECAR_STORAGE_CLASS,
+                                    extra_meta={"asset-id": asset_id, "variant": variant})
+
+            except ClientError as e:
+                log.error("AWS S3 Fehler bei %s (%s): %s", filename, variant, e)
+            except Exception as e:
+                log.error("Fehler bei %s (%s): %s", filename, variant, e)
+            finally:
+                try:
+                    if "tmp_path" in locals() and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
 
         processed += 1
+
         if MAX_ASSETS_PER_RUN and processed >= MAX_ASSETS_PER_RUN:
             log.info("MAX_ASSETS_PER_RUN erreicht (%s).", MAX_ASSETS_PER_RUN)
             break
 
+    _stage('Durchlauf fertig')
     log.info("Durchlauf beendet. verarbeitet=%s, hochgeladen=%s, übersprungen=%s", processed, uploaded, skipped)
 
 def main():
