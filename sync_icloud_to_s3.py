@@ -468,6 +468,11 @@ def process_once():
         if not asset_id:
             log.warning("Überspringe Asset ohne ID (Datei: %s)", filename); skipped += 1; continue
 
+        # --- Varianten-Logging ---
+        versions = getattr(asset, "versions", {}) or {}
+        variant_keys = list(versions.keys()) if hasattr(versions, "keys") else []
+        log.info("Asset %s: Gefundene Varianten: %s", asset_id, ", ".join(variant_keys) if variant_keys else "nur 'original'")
+
         albums_for_asset = albums_membership.get(asset_id) if albums_membership else []
 
         # ---- Ensure ORIGINAL ----
@@ -607,4 +612,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-PY
