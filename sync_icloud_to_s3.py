@@ -1,5 +1,4 @@
 # im Projektordner ausführen:
-cat > sync_icloud_to_s3.py <<'PY'
 #!/usr/bin/env python3
 # iCloud → S3 incremental backup (v2.4)
 # - ALWAYS back up ORIGINAL + LATEST (edited/rendered if available)
